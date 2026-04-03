@@ -1,4 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin"
+import { execSync } from "node:child_process"
 import {
   notify,
   setStatus,
@@ -18,21 +19,62 @@ const plugin: Plugin = async ({ client, $, serverUrl }) => {
 
   const originalSurfaceId = process.env.CMUX_SURFACE_ID
 
-  let resolvedServerUrl = ""
-  let splitsEnabled = false
-  try {
-    const raw = serverUrl?.toString() ?? ""
-    const parsed = new URL(raw)
-    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80")
-    if (port !== "0") {
-      if (parsed.hostname === "0.0.0.0" || parsed.hostname === "[::]") {
-        parsed.hostname = "localhost"
-      }
-      resolvedServerUrl = parsed.toString().replace(/\/$/, "")
-      splitsEnabled = true
+  // Discover the actual server URL for `opencode attach`.
+  //
+  // The TUI does not start an HTTP server unless --port is passed.
+  // When --port is used, we discover the real bound port via:
+  //   1. OPENCODE_SERVER_URL env var (future: anomalyco/opencode#9099).
+  //   2. serverUrl from plugin input (correct when --port N, port 0 when --port 0).
+  //   3. lsof on the current PID to find the actual LISTEN port.
+  //
+  // Returns null when no HTTP server is running (splits are skipped).
+  let discoveredServerUrl: string | null = null
+  function resolveServerUrl(): string | null {
+    if (discoveredServerUrl) return discoveredServerUrl
+
+    // 1. Env var (future-proof for when anomalyco/opencode#9099 lands)
+    if (process.env.OPENCODE_SERVER_URL) {
+      try {
+        const parsed = new URL(process.env.OPENCODE_SERVER_URL)
+        if (parsed.hostname === "0.0.0.0" || parsed.hostname === "[::]") {
+          parsed.hostname = "localhost"
+        }
+        discoveredServerUrl = parsed.toString().replace(/\/$/, "")
+        return discoveredServerUrl
+      } catch {}
     }
-  } catch {
-    // swallow errors silently
+
+    // 2. serverUrl from plugin input — correct when --port <N> (not 0)
+    try {
+      const raw = serverUrl?.toString() ?? ""
+      const parsed = new URL(raw)
+      const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80")
+      if (port !== "0") {
+        if (parsed.hostname === "0.0.0.0" || parsed.hostname === "[::]") {
+          parsed.hostname = "localhost"
+        }
+        discoveredServerUrl = parsed.toString().replace(/\/$/, "")
+        return discoveredServerUrl
+      }
+    } catch {}
+
+    // 3. Find the TCP port this process is listening on via lsof.
+    //    Use -a to AND the -p and -iTCP filters (macOS lsof ORs by default).
+    try {
+      const out = execSync(
+        `lsof -nP -a -p ${process.pid} -iTCP -sTCP:LISTEN 2>/dev/null`,
+        { encoding: "utf-8", timeout: 3000 },
+      )
+      for (const line of out.split("\n")) {
+        const match = line.match(/:(\d+)\s+\(LISTEN\)/)
+        if (match) {
+          discoveredServerUrl = `http://localhost:${match[1]}`
+          return discoveredServerUrl
+        }
+      }
+    } catch {}
+
+    return null
   }
 
   const activeSplits = new Map<string, string>()
@@ -109,7 +151,8 @@ const plugin: Plugin = async ({ client, $, serverUrl }) => {
 
       if (e.type === "session.created") {
         const info = e.properties.info
-        if (info?.parentID && splitsEnabled) {
+        const url = info?.parentID ? resolveServerUrl() : null
+        if (info?.parentID && url) {
           await enqueueSplitOp(async () => {
             if (activeSplits.has(info.id)) return
 
@@ -145,7 +188,7 @@ const plugin: Plugin = async ({ client, $, serverUrl }) => {
             activeSplits.set(info.id, surfaceId)
             agentCount++
 
-            const attachCmd = `opencode attach ${resolvedServerUrl} --session ${info.id}`
+            const attachCmd = `opencode attach ${url} --session ${info.id}`
             await sendToSurface($, surfaceId, attachCmd)
             await sendKeyToSurface($, surfaceId, "enter")
 
